@@ -1,0 +1,363 @@
+
+/*Library includes */
+#include "stdint.h"
+#include <string.h>
+#include "stdlib.h"
+#include "stdio.h"
+
+#include "inc/hw_ints.h"
+#include "inc/hw_memmap.h"
+#include "inc/hw_types.h"
+#include "driverlib/ethernet.h"
+#include "driverlib/gpio.h"
+#include "driverlib/interrupt.h"
+#include "driverlib/sysctl.h"
+#include "driverlib/systick.h"
+#include "rit128x96x4.h"
+#include "lwip/pbuf.h"
+#include "lwiplib.h"
+#include "locator.h"
+
+/*Library own */
+#include "target.h"
+
+/*Defines*/
+#define Snelheid				(6)
+#define TIEN					(10)
+#define SYSTICKHZ               100
+#define SYSTICKMS               (1000 / SYSTICKHZ)
+#define SYSTICK_INT_PRIORITY    0x80
+#define ETHERNET_INT_PRIORITY   0xC0
+
+/*functieprototypes*/
+static void prvSleep(uint32_t);
+static void prvTo_ascii(int32_t ,char * );
+
+/*mijn Globale variabelen*/
+char cText[20];								//maak global-geheugen array aan
+char cStopper[20];
+int32_t lHor=57, lVer=41, lSpeed=Snelheid; 	//zet fig in midden van scherm met Horizontaal en Verticaal var's
+int32_t lHorVorig=57, lVerVorig=41; 		//zet fig in midden van scherm
+uint32_t ulTellerMS=0;
+uint_fast8_t ucComp;
+volatile uint_fast8_t ucGotIp;
+
+/*---------------------------------------------------------------------------------------------------------------*/
+void prvSleep( uint32_t ulTijd )
+{ 	//tijd = milliseconde wachten
+	uint32_t ulTemp = ulTellerMS;    //glob teller geeft waarde aan temp
+
+	while( ulTellerMS <= ulTijd + ulTemp )
+		{   //wacht hier tot tijd ingegeven voldaan is..(eigen timer)
+
+		}
+}
+/*---------------------------------------------------------------------------------------------------------------*/
+void prvTo_ascii( int32_t lInteger, char *pAscii )
+{	int32_t lTemp,lCount=0, lI, lCnd=0;
+	memset(pAscii,0,10); //leegmaken array
+
+     if( lInteger >> 31 )
+     {
+    	 /*CONVERTING 2's complement value to normal value*/
+    	 lInteger=~lInteger+1;
+    	 for( lTemp = lInteger; lTemp != 0; lTemp /= 10, lCount++ );
+    	 	 pAscii[0]=0x2D;
+    	 	 lCount++;
+    	 	 lCnd=1;
+     }
+     else
+     for( lTemp = lInteger; lTemp != 0; lTemp /= 10, lCount++ );
+     	 for( lI = lCount-1, lTemp = lInteger; lI >= lCnd; lI-- )
+     	 	 {
+     		 	 pAscii[lI]=(lTemp%10)+0x30;
+     		 	 lTemp/=10;
+     	 	 }
+     if ( lInteger == 0 ){ pAscii[0] = '0'; }
+}
+/*-----------------------------------------------------------------------------------------------------------------*/
+//callbackfuncties
+err_t connectedcall( void *arg, struct tcp_pcb *connectie, err_t err )  //zegt dat de connectie gemaakt is
+{
+ UARTprintf( "Connected\n" );
+ tcp_write( connectie, cStopper, 20, 0x01 ); //  1= lengte  0x01 =data copy stack
+
+ return;
+}
+/*-----------------------------------------------------------------------------------------------------------------*/
+//callback sent
+err_t sentcall(void *arg, struct tcp_pcb *connectie, u16_t len)
+{
+
+	UARTprintf( "Data Sent\n" );
+
+ return;
+}
+/*--------------------------------------------------------------------------------------------------------*/
+//callback receive
+err_t recvcall( void *arg, struct tcp_pcb *connectie, struct pbuf *p, err_t err )
+{
+ struct pbuf *pbackup = p;	//om terug te gaan naar begin van pakket
+
+ if( p == NULL )
+ 	{
+ 		tcp_close( connectie );
+ 		UARTprintf( "connection closed\n" );
+ 	}
+ 	else
+ 	{
+ 		while( 1 )
+ 		{
+ 			memcpy( cText , p->payload, p->len );
+
+ 			UARTprintf( "len: %d\n",p->len );
+
+ 			if( p->len == p->tot_len )
+ 			{
+ 				UARTprintf( "cText %s \n", cText );
+ 				UARTprintf( "payload %s \n", p->payload );
+ 				break;
+ 			}
+
+
+ 		}
+ 	}
+
+ 	tcp_recved( connectie, pbackup->tot_len );	//hele gelinkte lijst acknowledgen, daarna met nextptr volgende nodes uitlezen
+ 	UARTprintf( "free: %d\n", pbuf_free( pbackup ) );
+
+ 	return;
+}
+/*-----------------------------------------------------------------------------------------------------------------------*/
+
+void lwIPHostTimerHandler( void )  // Required by lwIP library to support any host-related timer functions.
+{
+    static unsigned long ulLastIPAddress = 0;
+    unsigned long ulIPAddress;
+    ulIPAddress = lwIPLocalIPAddrGet();
+
+		ucGotIp = 1;
+
+}
+/*-----------------------------------------------------------------------------------------------------------------------*/
+void SysTick_Handler( void )// The interrupt handler for the SysTick interrupt.
+{
+    lwIPTimer( SYSTICKMS ); // Call the lwIP timer handler.
+}
+
+/*-----------------------------------------------------------------------------------------------------------------------*/
+void Ethernet_IRQHandler( void )
+{
+	lwIPEthernetIntHandler();
+	if ( ulTellerMS <= 0xffffffff )  //hoogste getal dat in uint32 kan  => tel tot
+		{
+			ulTellerMS++; //als lager is dan max dan optellen
+		}
+	else{ ulTellerMS = 0; } // als hij hoger is dan hoogste max getal dan zet je hem op 0
+
+}
+/*----------------------------------------------------------------------------------------------------------------*/
+
+int main( void )
+{
+    uint32_t ulUser0, ulUser1;  //MAC-adres
+    char pucMACArray[8];
+	struct tcp_pcb * connectie;
+	struct ip_addr serverIp;
+	ucGotIp = NULL;
+
+    // Set the clocking to run directly from the crystal.
+    SysCtlClockSet(SYSCTL_SYSDIV_1 | SYSCTL_USE_OSC | SYSCTL_OSC_MAIN |SYSCTL_XTAL_8MHZ);
+
+    // Initialize the UART for debug output.
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOA);
+    GPIOPinTypeUART(GPIO_PORTA_BASE, GPIO_PIN_0 | GPIO_PIN_1);
+    UARTStdioInit(0);
+
+    // Initialize the OLED display.
+    RIT128x96x4Init(1000000);
+
+    // Enable and Reset the Ethernet Controller.
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_ETH);
+    SysCtlPeripheralReset(SYSCTL_PERIPH_ETH);
+
+    // Enable Port F for Ethernet LEDs en ook de knop select
+    //  LED0        Bit 3   Output
+    //  LED1        Bit 2   Output
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOF);
+    GPIODirModeSet(GPIO_PORTF_BASE, GPIO_PIN_2 | GPIO_PIN_3, GPIO_DIR_MODE_HW);
+    GPIOPadConfigSet(GPIO_PORTF_BASE, GPIO_PIN_2 | GPIO_PIN_3,GPIO_STRENGTH_2MA, GPIO_PIN_TYPE_STD);
+
+    // Configure the GPIOs used to read the state of the on-board push buttons.
+	SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOE);
+    GPIOPinTypeGPIOInput(GPIO_PORTE_BASE, GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_3);
+    GPIOPadConfigSet(GPIO_PORTE_BASE, GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_3, GPIO_STRENGTH_2MA, GPIO_PIN_TYPE_STD_WPU);
+    GPIOPinTypeGPIOInput(GPIO_PORTF_BASE, GPIO_PIN_1);
+    GPIOPadConfigSet(GPIO_PORTF_BASE, GPIO_PIN_1, GPIO_STRENGTH_2MA, GPIO_PIN_TYPE_STD_WPU);
+
+    // Configure SysTick for a periodic interrupt.
+    SysTickPeriodSet(SysCtlClockGet() / 1000);
+    SysTickEnable();
+    SysTickIntEnable();
+
+    // Enable processor interrupts.
+    IntMasterEnable();
+
+    // Configure the hardware MAC address for Ethernet Controller filtering of
+    // incoming packets.
+    // For the LM3S6965 Evaluation Kit, the MAC address will be stored in the
+    // non-volatile USER0 and USER1 registers.  These registers can be read
+    // using the FlashUserGet function, as illustrated below.
+
+    FlashUserGet(&ulUser0, &ulUser1);
+    if((ulUser0 == 0xffffffff) || (ulUser1 == 0xffffffff))
+    {
+
+        // We should never get here.  This is an error if the MAC address has
+        // not been programmed into the device.  Exit the program.
+        //
+        RIT128x96x4StringDraw("MAC Address", 0, 16, 15);
+        RIT128x96x4StringDraw("Not Programmed!", 0, 24, 15);
+        while(1)
+        {
+        	//en hier zit je dan zonder MAC-adres!!
+        }
+    }
+
+    // Convert the 24/24 split MAC address from NV ram into a 32/16 split MAC
+    // address needed to program the hardware registers, then program the MAC
+    // address into the Ethernet Controller registers.
+    pucMACArray[0] = ((ulUser0 >>  0) & 0xff);
+    pucMACArray[1] = ((ulUser0 >>  8) & 0xff);
+    pucMACArray[2] = ((ulUser0 >> 16) & 0xff);
+    pucMACArray[3] = ((ulUser1 >>  0) & 0xff);
+    pucMACArray[4] = ((ulUser1 >>  8) & 0xff);
+    pucMACArray[5] = ((ulUser1 >> 16) & 0xff);
+
+    // Initialze the lwIP library, using static IP.
+	// 192.168.69.10(c0.A8.45.0A)    255.255.255.0 192.168.0.1
+    lwIPInit(pucMACArray, 0xC0A8450A, 0xFFFFFF00, 0xC0A80001, IPADDR_USE_STATIC);
+
+    // Set the interrupt priorities.  We set the SysTick interrupt to a higher
+    // priority than the Ethernet interrupt to ensure that the file system
+    // tick is processed if SysTick occurs while the Ethernet handler is being
+    // processed.  This is very likely since all the TCP/IP and HTTP work is
+    // done in the context of the Ethernet interrupt.
+    IntPriorityGroupingSet(4);
+    IntPrioritySet(INT_ETH, ETHERNET_INT_PRIORITY);
+    IntPrioritySet(FAULT_SYSTICK, SYSTICK_INT_PRIORITY);
+
+    while(1)
+    {
+
+		RIT128x96x4Enable( 1000000 );
+		RIT128x96x4ImageDraw(IMG_DATA,lHor,lVer, IMG_DATA_X_PIXEL,IMG_DATA_Y_PIXEL);
+		RIT128x96x4Disable();
+
+		while( ucGotIp ){
+						int32_t lWelkeButton=0;
+						lWelkeButton = GPIOPinRead( GPIO_PORTE_BASE,  0xf);	//buttons inlezen + scherm up/down
+						RIT128x96x4Enable(1000000);
+
+						switch (lWelkeButton){
+							case 0x00000d :		//13
+				    				lVer++;		//down
+				    				RIT128x96x4ImageDraw( IMG_DATA, lHor, lVer, IMG_DATA_X_PIXEL, IMG_DATA_Y_PIXEL );
+				    				break;
+							case 0x00000e:		//14
+				    				lVer--;		//up
+				    				RIT128x96x4ImageDraw( IMG_DATA, lHor, lVer, IMG_DATA_X_PIXEL, IMG_DATA_Y_PIXEL );
+				    				break;
+				    		case 0x000007:
+				    				lHor++;		//right
+				    				RIT128x96x4ImageDraw( IMG_DATA, lHor, lVer, IMG_DATA_X_PIXEL, IMG_DATA_Y_PIXEL );
+				    				break;
+				    		case 0x00000b:		//11
+				    				lHor--;		//left
+				    				RIT128x96x4ImageDraw( IMG_DATA, lHor, lVer, IMG_DATA_X_PIXEL, IMG_DATA_Y_PIXEL );
+				    				break;
+				    		case 0x000009:
+				    				lHor--;		//down+left
+				    				lVer++;
+				    				RIT128x96x4ImageDraw( IMG_DATA, lHor, lVer, IMG_DATA_X_PIXEL, IMG_DATA_Y_PIXEL );
+				    				break;
+				    		case 0x00000A:		//10
+				    				lHor--;		//up+left
+				    				lVer--;
+				    				RIT128x96x4ImageDraw( IMG_DATA, lHor, lVer, IMG_DATA_X_PIXEL, IMG_DATA_Y_PIXEL );
+				    				break;
+				    		case 0x000006:
+				    				lHor++;		//down+right
+				    				lVer--;
+				    				RIT128x96x4ImageDraw( IMG_DATA, lHor, lVer, IMG_DATA_X_PIXEL, IMG_DATA_Y_PIXEL );
+				    				break;
+				    		case 0x000005:
+				    				lHor++;		//up+right
+				    				lVer++;
+				    				RIT128x96x4ImageDraw( IMG_DATA, lHor, lVer, IMG_DATA_X_PIXEL, IMG_DATA_Y_PIXEL );
+				    				break;
+							default:{ /*zit hier tenzij knopke gedrukt*/ }
+							}
+
+
+				    	//afbakenen van scherm
+				    	if ( lHor > 113 )
+				    			{lHor = 113;}
+				    	if ( lHor <= 1 )
+				    			{lHor = 1;}
+				    	if ( lVer > 82 )
+				    			{lVer = 82;}
+				    	if (lVer <= 1 )
+				    			{lVer = 1;}
+
+				    	//vertaging van figuur
+				    	prvSleep( TIEN );
+
+				    	RIT128x96x4Disable();
+
+				    	if ( GPIOPinRead( GPIO_PORTF_BASE, GPIO_PIN_1 ) != 0b10 )
+				    	{																	// inlezen van figuur scherm en omzeten naar getal in ascii
+				    		char cBericht[20]= "X "; //X_
+				    		char cGetal[10] = {0}; 											//alles eerst leegmaken anders rare sjit in ascii
+				    		int32_t lHulpy,lHulpx;
+
+				    		lHulpx =( ( lHor - 57 ) *9 ) - ( ( lHorVorig - 57 ) * 9 ); 		//om juist getal te krijgen
+				    		lHorVorig = lHor;
+				    		lHulpy=( ( lVer - 41 ) * 12 ) - ( ( lVerVorig - 41 ) * 12 );
+				    		lVerVorig = lVer;
+				    		prvTo_ascii ( lHulpx , cGetal );
+				    		strcat( cBericht, cGetal ); 									//zet in string X 57
+				    		strcat( cBericht, " Y " ); 										//zet in string X 57 Y
+				    		prvTo_ascii ( lHulpy, cGetal ); 								//omzetten
+				    		strcat( cBericht, cGetal ); 									// zet string X 57 Y 57
+				    		strcat( cBericht, " " ); 										//zet in string X 57 Y
+				    		prvTo_ascii ( lSpeed, cGetal );
+				    		strcat( cBericht, cGetal );										// zet in string X 57 Y 57 20
+
+				    		ucComp=strcmp( cBericht, cStopper ); 							//als deze gelijk zijn dan is het 0
+
+				    		if ( ( ucComp != 0 ) & ( ( lHulpx + lHulpy ) != 0 ) )			//als comp niet gelijk is of als h en v niet samen 0 zijn
+				    		{
+				    			UARTprintf( "bericht= %s stopper %s\n", cBericht , cStopper );
+				    			strcpy( cStopper, cBericht );
+				    			IP4_ADDR( &serverIp, 192,168,69,148 ); 						//geef een ip4 adres op
+				    			connectie = tcp_new(); 										// geeft een nieuwe stuct van tcp aan connect
+				    			tcp_connect( connectie, &serverIp, 64000, connectedcall );  //zegt tegen lwplib dat als ACK er is functie connectedcall uitvoeren
+				    			tcp_sent( connectie, sentcall ); 							//sendcall is callbackfunc
+				    			tcp_recv( connectie,recvcall ); 							// recvcall is callbackfunc
+				    		}
+
+				    	}	//einde if
+
+					}		//einde while gotip
+    }						//einde grote while(1)
+}							//einde main
+
+
+
+
+
+
+
+
+
